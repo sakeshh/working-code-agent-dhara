@@ -6,6 +6,10 @@ and produces an ordered, dependency-aware ETL Plan JSON.
 
 Canonical transform ordering is deterministic (NOT LLM-decided).
 Business rules from business_rules.yaml are applied as constraints.
+
+Patches applied (2026-05-12):
+  - validate_etl_plan: fixed column schema key — actual assessment_result uses
+    'column_stats' not 'columns' to store per-column metadata.
 """
 from __future__ import annotations
 
@@ -62,7 +66,6 @@ def load_business_rules(config_path: Optional[str] = None) -> Dict[str, Any]:
     """Load business_rules.yaml. Returns empty dict if not found."""
     path = config_path or os.environ.get("BUSINESS_RULES_PATH")
     if not path:
-        # Try default locations
         candidates = [
             os.path.join("config", "business_rules.yaml"),
             os.path.join("..", "config", "business_rules.yaml"),
@@ -110,7 +113,6 @@ def check_business_rule_conflicts(
 
     never_drop = table_rules.get("never_drop_rows", False)
 
-    # Global PK patterns
     global_cfg = rules.get("global", {})
     pk_patterns = global_cfg.get("protected_pk_column_patterns", ["_id", "id"])
 
@@ -119,36 +121,39 @@ def check_business_rule_conflicts(
         action = step.get("action", "")
         col_lower = (col or "").lower()
 
-        # Check: never_drop_rows violation
         if never_drop and action in ("fill_or_drop", "deduplicate", "deduplicate_or_alert"):
             conflicts.append({
                 "column": col,
                 "action": action,
                 "rule": "never_drop_rows",
-                "reason": f"Dataset '{dataset_name}' has never_drop_rows=true. "
-                           f"Action '{action}' may delete rows. Use fill only, not drop."
+                "reason": (
+                    f"Dataset '{dataset_name}' has never_drop_rows=true. "
+                    f"Action '{action}' may delete rows. Use fill only, not drop."
+                )
             })
 
-        # Check: never_modify on PK columns
         col_cfg = col_rules.get(col, {})
         if col_cfg.get("never_modify") and action not in ("review_manually", "trim"):
             conflicts.append({
                 "column": col,
                 "action": action,
                 "rule": "never_modify",
-                "reason": f"Column '{col}' in '{dataset_name}' is marked never_modify. "
-                           f"Action '{action}' would change its value."
+                "reason": (
+                    f"Column '{col}' in '{dataset_name}' is marked never_modify. "
+                    f"Action '{action}' would change its value."
+                )
             })
 
-        # Check: protected PK pattern columns being dropped/nullified
         if any(col_lower.endswith(p) or col_lower == p.lstrip("_") for p in pk_patterns):
             if action in ("fill_or_drop", "zero_to_null"):
                 conflicts.append({
                     "column": col,
                     "action": action,
                     "rule": "protected_pk_column_patterns",
-                    "reason": f"Column '{col}' matches a PK pattern. "
-                               f"Action '{action}' must not nullify or drop PK values."
+                    "reason": (
+                        f"Column '{col}' matches a PK pattern. "
+                        f"Action '{action}' must not nullify or drop PK values."
+                    )
                 })
 
     return conflicts
@@ -205,7 +210,6 @@ def build_etl_plan(
 
     for ds_name, items in datasets_manifest.items():
         if ds_name == "_global":
-            # Handle global steps (e.g. referential integrity)
             for item in items:
                 action = item.get("suggested_action", "")
                 if action in skip_actions:
@@ -232,7 +236,6 @@ def build_etl_plan(
             col = item.get("column")
             issue_type = item.get("issue_type", "")
 
-            # Skip user-overridden actions
             if action in skip_actions:
                 continue
 
@@ -245,7 +248,6 @@ def build_etl_plan(
                 })
                 continue
 
-            # Check for BLOCKED issues (empty dataset, duplicate column names)
             if issue_type in ("empty_dataset", "duplicate_column_names", "case_insensitive_column_collision"):
                 total_blocked += 1
                 blocked.append({
@@ -264,14 +266,11 @@ def build_etl_plan(
             })
             total_auto += 1
 
-        # Sort steps by canonical order
         auto_steps.sort(key=lambda s: (s["order"], s["column"] or ""))
 
-        # Re-number steps after sort
         for i, step in enumerate(auto_steps, start=1):
             step["step_number"] = i
 
-        # Check business rule conflicts
         conflicts = check_business_rule_conflicts(auto_steps, ds_name, business_rules)
         if conflicts:
             plan["business_rule_conflicts"].extend([
@@ -286,7 +285,6 @@ def build_etl_plan(
             "has_conflicts": len(conflicts) > 0,
         }
 
-    # Sort global steps by order
     plan["global_steps"].sort(key=lambda s: s["order"])
     for i, step in enumerate(plan["global_steps"], start=1):
         step["step_number"] = i
@@ -352,23 +350,26 @@ def validate_etl_plan(
             key = (step.get("column"), step.get("action"))
             if key in seen:
                 errors.append(
-                    f"DUPLICATE [{ds_name}]: Step (column='{key[0]}', action='{key[1]}') appears twice."
+                    f"DUPLICATE [{ds_name}]: Step (column='{key[0]}', "
+                    f"action='{key[1]}') appears twice."
                 )
             seen.add(key)
 
-    # Check columns exist in assessment schema
+    # FIX: actual assessment_result stores per-column info under 'column_stats',
+    # not 'columns'. Support both keys for backwards compatibility.
     if assessment_result:
         datasets_meta = assessment_result.get("datasets", {}) or {}
         for ds_name, ds_plan in plan.get("datasets", {}).items():
-            schema_cols = set(
-                (datasets_meta.get(ds_name, {}) or {}).get("columns", {}).keys()
-            )
+            ds_meta = datasets_meta.get(ds_name, {}) or {}
+            # Support both 'column_stats' (actual schema) and 'columns' (legacy)
+            col_meta = ds_meta.get("column_stats") or ds_meta.get("columns") or {}
+            schema_cols = set(col_meta.keys())
             for step in ds_plan.get("steps", []):
                 col = step.get("column")
                 if col and schema_cols and col not in schema_cols:
                     errors.append(
-                        f"MISSING COLUMN [{ds_name}]: Column '{col}' referenced in plan "
-                        f"does not exist in dataset schema."
+                        f"MISSING COLUMN [{ds_name}]: Column '{col}' referenced in "
+                        f"plan does not exist in dataset schema."
                     )
 
     is_valid = len(errors) == 0
@@ -384,16 +385,20 @@ def format_plan_for_display(plan: Dict[str, Any]) -> str:
     Format the ETL plan as a human-readable markdown table for chat UI.
     """
     lines = []
-    lines.append(f"## 📋 ETL Plan `{plan.get('plan_id', 'unknown')}`")
-    lines.append(f"**Engine:** `{plan.get('engine', 'python')}` | "
-                 f"**Target:** `{plan.get('target_mode', 'new_file')}` | "
-                 f"**Output:** `{plan.get('target_path', '')}`")
+    lines.append(f"## \U0001f4cb ETL Plan `{plan.get('plan_id', 'unknown')}`")
+    lines.append(
+        f"**Engine:** `{plan.get('engine', 'python')}` | "
+        f"**Target:** `{plan.get('target_mode', 'new_file')}` | "
+        f"**Output:** `{plan.get('target_path', '')}`"
+    )
     lines.append("")
 
     summary = plan.get("summary", {})
-    lines.append(f"✅ **{summary.get('total_auto_steps', 0)} auto steps** | "
-                 f"⚠️ **{summary.get('total_manual_review', 0)} manual reviews** | "
-                 f"🚫 **{summary.get('total_blocked', 0)} blocked**")
+    lines.append(
+        f"\u2705 **{summary.get('total_auto_steps', 0)} auto steps** | "
+        f"\u26a0\ufe0f **{summary.get('total_manual_review', 0)} manual reviews** | "
+        f"\U0001f6ab **{summary.get('total_blocked', 0)} blocked**"
+    )
     lines.append("")
 
     for ds_name, ds_plan in plan.get("datasets", {}).items():
@@ -416,20 +421,22 @@ def format_plan_for_display(plan: Dict[str, Any]) -> str:
         manual = ds_plan.get("manual_review", [])
         if manual:
             lines.append("")
-            lines.append("⚠️ **Manual Review Required:**")
+            lines.append("\u26a0\ufe0f **Manual Review Required:**")
             for m in manual:
-                lines.append(f"- `{m.get('column')}`: {m.get('issue_type')} — {m.get('guidance', '')}")
+                lines.append(
+                    f"- `{m.get('column')}`: {m.get('issue_type')} "
+                    f"— {m.get('guidance', '')}"
+                )
 
         blocked = ds_plan.get("blocked", [])
         if blocked:
             lines.append("")
-            lines.append("🚫 **Blocked — Must Resolve Before ETL:**")
+            lines.append("\U0001f6ab **Blocked — Must Resolve Before ETL:**")
             for b in blocked:
                 lines.append(f"- `{b.get('column')}`: {b.get('reason', '')}")
 
         lines.append("")
 
-    # Global steps
     global_steps = plan.get("global_steps", [])
     if global_steps:
         lines.append("### Global Steps (cross-dataset)")
@@ -443,19 +450,20 @@ def format_plan_for_display(plan: Dict[str, Any]) -> str:
             )
         lines.append("")
 
-    # Conflicts
     conflicts = plan.get("business_rule_conflicts", [])
     if conflicts:
-        lines.append("🔴 **Business Rule Conflicts — Plan Cannot Proceed:**")
+        lines.append("\U0001f534 **Business Rule Conflicts — Plan Cannot Proceed:**")
         for c in conflicts:
-            lines.append(f"- [{c.get('dataset')}] `{c.get('column')}`: {c.get('reason')}")
+            lines.append(
+                f"- [{c.get('dataset')}] `{c.get('column')}`: {c.get('reason')}"
+            )
         lines.append("")
 
     if summary.get("ready_for_codegen"):
-        lines.append("👉 **Plan is ready for code generation.**")
+        lines.append("\U0001f449 **Plan is ready for code generation.**")
         lines.append("> Reply with **approve**, **modify**, or **cancel**.")
     else:
-        lines.append("❌ **Plan has issues that must be resolved before code generation.**")
+        lines.append("\u274c **Plan has issues that must be resolved before code generation.**")
         lines.append("> Please review the conflicts/blocked items above.")
 
     return "\n".join(lines)
