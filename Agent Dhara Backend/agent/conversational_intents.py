@@ -10,6 +10,7 @@ Intent IDs:
   6 CLARIFY
   7 OUT_OF_SCOPE
   8 ADVERSARIAL
+  9 ETL_GENERATE          ← NEW: generate ETL/transformation code
 """
 from __future__ import annotations
 import re
@@ -51,32 +52,58 @@ def _is_adversarial(low: str) -> bool:
     return any(p in low for p in patterns)
 
 
+def _is_etl_generate(low: str) -> bool:
+    """
+    Intent 9 — ETL / transformation code generation.
+    MUST be checked BEFORE _is_ood() because _is_ood() blocks these keywords.
+    Triggers when the user asks Agent Dhara to produce ETL/cleaning code
+    based on the current assessment.
+    """
+    etl_keys = (
+        "generate etl code",
+        "generate etl",
+        "etl code",
+        "write etl",
+        "create etl",
+        "build etl",
+        "generate transformation",
+        "generate transformations",
+        "write transformation",
+        "create transformation code",
+        "build transformation",
+        "generate cleaning code",
+        "write cleaning code",
+        "create cleaning code",
+        "generate python etl",
+        "generate sql etl",
+        "generate pyspark",
+        "generate pyspark etl",
+        "write pyspark etl",
+        "generate adf",
+        "generate pipeline code",
+        "write pipeline code",
+        "build pipeline code",
+        "code to fix the data",
+        "code to clean the data",
+        "code to clean this",
+        "code to fix this",
+        "auto fix",
+        "autofix",
+        "generate the fix",
+        "generate fix",
+        "produce etl",
+        "produce transformation",
+        "produce cleaning",
+    )
+    return any(k in low for k in etl_keys)
+
+
 def _is_ood(low: str) -> bool:
     """
     Out-of-domain detection — catches anything not related to DQ assessment.
-    Covers: code generation, general knowledge, finance, sports, coding help.
+    NOTE: ETL code generation is intentionally excluded here — it is handled
+    by _is_etl_generate() (intent 9) which runs BEFORE this check.
     """
-    # ── Code / script generation (most important new addition) ──────────────
-    code_keys = (
-        "generate code", "write code", "etl code", "generate etl code",
-        "generate etl", "write etl", "create etl", "build etl",
-        "python code", "python script", "write python", "write a python",
-        "write sql", "generate sql", "create sql", "sql script",
-        "write script", "generate script", "create script", "build script",
-        "write a script", "give me code", "give code", "show me code",
-        "write me code", "code for this", "code to fix", "code to clean",
-        "automate this", "automate the fix", "write automation",
-        "write pipeline", "build pipeline", "create pipeline",
-        "write a pipeline", "generate pipeline", "build a pipeline",
-        "spark code", "pyspark", "pandas code", "write pandas",
-        "write pyspark", "generate pyspark", "write spark",
-        "write dbt", "generate dbt", "dbt model", "write dbt model",
-        "write airflow", "generate airflow", "airflow dag",
-        "write dag", "generate dag",
-    )
-    if any(k in low for k in code_keys):
-        return True
-
     # ── General knowledge / off-domain ──────────────────────────────────────
     general_keys = (
         "stock price", "share price", "nifty", "sensex", "nyse", "nasdaq",
@@ -87,6 +114,12 @@ def _is_ood(low: str) -> bool:
         "latest news", "who won",
         "write a poem", "tell me a joke", "what is the weather",
         "how to cook", "recipe for",
+        # Generic coding help not related to this data
+        "write a python script", "write a python", "how to code",
+        "coding tutorial", "python tutorial",
+        "write airflow", "generate airflow", "airflow dag",
+        "write dag", "generate dag",
+        "write dbt", "generate dbt", "dbt model",
     )
     return any(k in low for k in general_keys)
 
@@ -164,7 +197,6 @@ def _is_issue_list(low: str) -> bool:
         "rows should worry", "worry me the most", "auto-fixable", "manual review",
         "which columns", "business risks", "business risk", "data engineer",
         "data engineer-focused", "auto fixable",
-        # natural language additions
         "what problems", "what are the problems", "what issues",
         "what are the issues", "show me issues", "show issues",
         "what went wrong", "tell me the issues", "list the problems",
@@ -186,10 +218,6 @@ def _is_issue_list(low: str) -> bool:
 
 
 def _is_full_report(low: str) -> bool:
-    """
-    Only triggers on EXPLICIT report generation requests.
-    Never triggers on bare 'generate' or 'create' without 'report'.
-    """
     return any(k in low for k in (
         "executive summary",
         "full narrative",
@@ -214,7 +242,6 @@ def _is_full_report(low: str) -> bool:
         "give me a report",
         "show me a report",
         "produce a report",
-        # NOTE: bare "generate" / "generate etl" removed — caught by _is_ood()
     ))
 
 
@@ -229,11 +256,15 @@ def classify_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str,
     if raw.strip().startswith("```"):
         return None
 
-    # Safety checks run first — before any other matching
+    # 1. Safety checks always run first
     if _is_adversarial(low):
         return {"intent": 8, "reason": "adversarial_policy"}
 
-    # OOD check runs BEFORE report/issue checks to prevent misrouting
+    # 2. ETL generation — checked BEFORE OOD so it is never blocked
+    if _is_etl_generate(low):
+        return {"intent": 9, "reason": "etl_generate"}
+
+    # 3. OOD check runs before report/issue checks
     if _is_ood(low):
         return {"intent": 7, "reason": "out_of_domain"}
 
