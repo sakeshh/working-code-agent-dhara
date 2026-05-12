@@ -24,6 +24,7 @@ from agent.mcp_interface import (
 )
 from agent.transformation_suggester import suggest_transformations
 from agent.requirements_to_config import build_user_request_text, requirements_to_selected_sources
+from agent.etl_endpoint import etl_router
 
 # Load local .env automatically (developer convenience; do not rely on this in production).
 try:
@@ -92,6 +93,9 @@ setup_logging()
 logger = logging.getLogger("mcp_server")
 
 app = FastAPI(title="Intelligent Data Assessment MCP Server")
+
+# Mount ETL router — adds /generate_etl_code, /approve_etl_code, /etl_status, /etl_files
+app.include_router(etl_router)
 
 _limiter = InMemoryRateLimiter(
     max_requests=int(os.environ.get("RATE_LIMIT_PER_MINUTE", "120")),
@@ -322,7 +326,7 @@ def api_sources() -> Dict[str, Any]:
 def api_assess(payload: AssessPayload, request: Request) -> Dict[str, Any]:
     """
     High-level orchestration endpoint:
-    uses LangGraph orchestrator (route → extract → transform).
+    uses LangGraph orchestrator (route -> extract -> transform).
     """
     from agent.langgraph_orchestrator import run_orchestrator
 
