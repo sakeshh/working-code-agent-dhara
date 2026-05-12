@@ -1,143 +1,80 @@
-# ============================================================
-# Agent Dhara — Business Rules Registry
-# Used by: capture_business_rules_node (ETL Node 2)
+# Business Rules Registry — Agent Dhara
+# =========================================
+# Define dataset-level and column-level constraints that override
+# the transformation suggester's default suggestions.
 #
 # Structure:
-#   global:        rules that apply to ALL datasets
 #   datasets:
 #     <dataset_name>:
-#       columns:
-#         <column_name>: rules for that specific column
-#       table_rules:     rules at the table/dataset level
+#       never_drop_rows: bool          # If true, fill_or_drop will FILL only
+#       never_drop_columns: [col, ...] # These columns must never be removed
+#       required_non_null: [col, ...]  # These columns must always have values
+#       valid_values:                  # Allowed values for specific columns
+#         <column>: [val1, val2, ...]
+#       numeric_range:                 # Valid range for numeric columns
+#         <column>:
+#           min: number
+#           max: number
+#       custom_rules: [str, ...]       # Free-text rules shown to user during review
 #
-# Rule types:
-#   not_null         : column must never be null/empty
-#   never_drop       : rows in this dataset must NEVER be dropped
-#   never_modify     : column value must never be changed
-#   must_be_positive : numeric column must be > 0
-#   allowed_values   : column must only contain listed values
-#   max_length       : string column max character length
-#   date_range       : date column must be within [min, max]
-#   unique           : column values must be unique (PK enforcement)
-#   no_future_dates  : date column must not exceed today
-#   min_row_count    : dataset must have at least N rows to proceed
-# ============================================================
+# Usage: Loaded by capture_business_rules_node at the start of ETL flow.
+# Overrides: planning_node uses these to constrain transform choices.
+# =========================================
 
-# ------------------------------------
-# GLOBAL RULES (apply to all datasets)
-# ------------------------------------
+# --- Default global rules (apply to ALL datasets unless overridden) ---
 global:
-  # If a dataset has fewer rows than this, abort ETL and raise alert
-  min_row_count: 1
+  never_drop_rows: false
+  flag_instead_of_drop: false
 
-  # These column name patterns are ALWAYS treated as primary keys
-  # — never drop, never nullify
-  protected_pk_column_patterns:
-    - "_id"
-    - "id"
-
-  # These column name patterns are ALWAYS treated as PII
-  # — flag for masking review before ETL
-  pii_column_patterns:
-    - "email"
-    - "phone"
-    - "ssn"
-    - "passport"
-    - "aadhaar"
-    - "pan"
-    - "address"
-    - "dob"
-    - "date_of_birth"
-
-# ------------------------------------
-# DATASET-SPECIFIC RULES
-# Add your dataset rules below.
-# Dataset name must match exactly what appears in the assessment result.
-# ------------------------------------
+# --- Example dataset rules (edit or add your datasets below) ---
 datasets:
-
-  # Example: customers dataset
   customers:
-    table_rules:
-      never_drop_rows: false          # Set true to prevent ANY row deletion
-      min_row_count: 10               # Alert if fewer than 10 rows after ETL
-    columns:
-      customer_id:
-        not_null: true
-        unique: true
-        never_modify: true            # PK — never change its value
-      email:
-        not_null: false               # email can be null (optional field)
-        max_length: 254               # RFC 5321 email max length
-      phone:
-        not_null: false
-        max_length: 20
-      age:
-        must_be_positive: true
-      status:
-        allowed_values:
-          - "ACTIVE"
-          - "INACTIVE"
-          - "SUSPENDED"
-          - "PENDING"
+    never_drop_rows: true
+    never_drop_columns:
+      - customer_id
+      - email
+    required_non_null:
+      - customer_id
+    valid_values:
+      status: ["ACTIVE", "INACTIVE", "PENDING", "SUSPENDED"]
+    custom_rules:
+      - "customer_id must be globally unique — never deduplicate by partial key"
+      - "email is PII — do not log raw values in output reports"
 
-  # Example: orders dataset
   orders:
-    table_rules:
-      never_drop_rows: true           # Financial records — NEVER drop rows
-      min_row_count: 1
-    columns:
-      order_id:
-        not_null: true
-        unique: true
-        never_modify: true
-      customer_id:
-        not_null: true                # FK — must always reference customers
-        never_modify: true
+    never_drop_rows: false
+    required_non_null:
+      - order_id
+      - customer_id
+    numeric_range:
       amount:
-        must_be_positive: true
-        not_null: true
-      order_date:
-        not_null: true
-        no_future_dates: true
-        date_range:
-          min: "2000-01-01"
-          max: null                   # null = no upper bound (use today)
-      status:
-        allowed_values:
-          - "PENDING"
-          - "CONFIRMED"
-          - "SHIPPED"
-          - "DELIVERED"
-          - "CANCELLED"
-          - "REFUNDED"
+        min: 0
+        max: 1000000
+      quantity:
+        min: 1
+        max: 10000
+    valid_values:
+      status: ["PENDING", "CONFIRMED", "SHIPPED", "DELIVERED", "CANCELLED", "REFUNDED"]
+    custom_rules:
+      - "amount must always be > 0 — zero-amount orders indicate a data entry error"
+      - "orders.customer_id must exist in customers.customer_id (referential integrity)"
 
-  # Example: products dataset
   products:
-    table_rules:
-      never_drop_rows: false
-      min_row_count: 1
-    columns:
-      product_id:
-        not_null: true
-        unique: true
-        never_modify: true
+    never_drop_rows: false
+    required_non_null:
+      - product_id
+      - sku
+    numeric_range:
       price:
-        must_be_positive: true
-        not_null: true
-      stock_quantity:
-        must_be_positive: false       # can be 0 (out of stock)
-        not_null: true
+        min: 0
+        max: 999999
+    custom_rules:
+      - "sku must follow format: [A-Z]{3}-[0-9]{4} (e.g. ABC-1234)"
+      - "price of 0 is allowed for free/promotional products"
 
-# ------------------------------------
-# HOW TO ADD A NEW DATASET:
-#
-# my_new_dataset:
-#   table_rules:
-#     never_drop_rows: false
-#     min_row_count: 1
-#   columns:
-#     my_column:
-#       not_null: true
-#       allowed_values: ["A", "B", "C"]
-# ------------------------------------
+# Add your project-specific datasets below:
+# my_dataset:
+#   never_drop_rows: true
+#   required_non_null: [id]
+#   valid_values:
+#     category: ["A", "B", "C"]
