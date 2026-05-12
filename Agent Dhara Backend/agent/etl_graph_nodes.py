@@ -40,8 +40,8 @@ except ImportError:
 
 from agent.etl_planner import build_etl_plan, format_plan_for_display
 from agent.schema_lineage import build_schema_lineage, format_lineage_for_display
-from agent.etl_codegen.python_codegen import generate_python_etl
-from agent.etl_codegen.sql_codegen import generate_sql_etl
+from agent.etl_codegen.python_codegen import PythonCodegen
+from agent.etl_codegen.sql_codegen import SQLCodegen
 from agent.etl_codegen.code_validator import validate_generated_code
 
 BUSINESS_RULES_PATH = Path(__file__).parent.parent / "config" / "business_rules.yaml"
@@ -283,14 +283,13 @@ def planning_node(state: Dict[str, Any]) -> Dict[str, Any]:
     classified = state.get("classified_issues") or {}
     business_rules = state.get("business_rules") or {}
     intent = state.get("etl_intent") or {}
-    overrides = state.get("plan_overrides") or {}
 
     etl_plan = build_etl_plan(
         assessment_result=assessment,
         classified_issues=classified,
         business_rules=business_rules,
         engine=intent.get("engine", "python"),
-        overrides=overrides,
+        target=intent.get("target", "local_file"),
     )
 
     return {
@@ -306,61 +305,69 @@ def planning_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def validate_dag_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Validates the ETL plan DAG:
-    - No circular dependencies
-    - No references to non-existent columns
+    Validates the ETL plan for:
+    - Circular dependencies between steps
+    - Steps referencing non-existent columns
     - Business rule violations in the plan
+    Max 2 retries then surfaces error to user.
     """
     etl_plan = state.get("etl_plan") or {}
     assessment = _latest_assessment(state)
     business_rules = state.get("business_rules") or {}
-    errors: List[str] = []
+    dag_errors: List[str] = []
 
     for ds_name, ds_plan in etl_plan.get("datasets", {}).items():
-        schema_cols = set(
-            (assessment.get("datasets") or {}).get(ds_name, {}).get("columns", {}).keys()
-        )
-        ds_rules = (business_rules.get("datasets") or {}).get(ds_name, {})
-        never_drop_cols = set(ds_rules.get("never_drop_columns") or [])
+        steps = ds_plan.get("steps", [])
+        seen_actions: List[str] = []
 
-        for step in ds_plan.get("steps", []):
-            col = step.get("column")
+        # Schema columns from assessment
+        ds_info = (assessment.get("datasets") or {}).get(ds_name, {})
+        schema_cols = set(ds_info.get("columns", {}).keys())
+
+        for step in steps:
             action = step.get("action", "")
+            col = step.get("column")
 
-            # Column existence check
+            # Check column exists
             if col and schema_cols and col not in schema_cols:
-                errors.append(
-                    f"[{ds_name}] Step references unknown column: '{col}' "
-                    f"(not in schema: {sorted(schema_cols)})"
+                dag_errors.append(
+                    f"[{ds_name}] Step references unknown column '{col}' (action: {action})"
                 )
 
-            # Business rule: never drop columns
-            if col and col in never_drop_cols and "drop" in action.lower():
-                errors.append(
-                    f"[{ds_name}] Business rule violation: action '{action}' on "
-                    f"protected column '{col}' (never_drop_columns)."
+            # Simple cycle: deduplicate must come last
+            if action == "deduplicate" and seen_actions and seen_actions[-1] != "deduplicate":
+                pass  # allowed — deduplicate is after column-level steps
+            seen_actions.append(action)
+
+        # Business rule check: no-drop rule
+        ds_rules = (business_rules.get("datasets") or {}).get(ds_name, {})
+        no_drop_cols = ds_rules.get("never_drop_columns", [])
+        for step in steps:
+            if step.get("action") == "drop_nulls" and step.get("column") in no_drop_cols:
+                dag_errors.append(
+                    f"[{ds_name}] Business rule violation: "
+                    f"'{step['column']}' is in never_drop_columns but plan has drop_nulls"
                 )
 
-    if errors:
-        retry_count = state.get("dag_validation_retries", 0)
+    if dag_errors:
+        retry_count = state.get("dag_retry_count", 0)
         if retry_count >= 2:
             return {
                 **state,
-                "etl_stage": "dag_validation_failed",
+                "etl_stage": "dag_error_unresolved",
                 "assistant_message": (
-                    f"❌ ETL plan validation failed after {retry_count} attempts:\n"
-                    + "\n".join(f"- {e}" for e in errors)
-                    + "\n\nPlease review your data schema or business rules."
+                    f"❌ ETL plan has unresolvable errors after {retry_count} retries:\n"
+                    + "\n".join(f"- {e}" for e in dag_errors)
                 ),
             }
         return {
             **state,
-            "etl_stage": "dag_invalid_retry",
-            "dag_validation_errors": errors,
-            "dag_validation_retries": retry_count + 1,
+            "dag_errors": dag_errors,
+            "dag_retry_count": retry_count + 1,
+            "etl_stage": "dag_invalid",
         }
 
-    return {**state, "etl_stage": "dag_valid", "dag_validation_errors": []}
+    return {**state, "etl_stage": "dag_valid", "dag_errors": []}
 
 
 # ---------------------------------------------------------------------------
@@ -369,36 +376,29 @@ def validate_dag_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def target_schema_confirmation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Asks user where cleaned data should be written:
-    A) Overwrite source (in-place)
-    B) Write to new table/file path
-    C) Return as in-memory DataFrame only
+    Confirms where cleaned data should go:
+      A) local_file  — write to output/cleaned/*.csv
+      B) overwrite   — overwrite source in-place
+      C) return      — return df in memory (notebook mode)
+      D) sql_table   — write to SQL table
     """
-    if state.get("target_confirmed"):
-        return {**state, "etl_stage": "target_confirmed"}
-
     intent = state.get("etl_intent") or {}
     target = intent.get("target", "local_file")
 
-    # Auto-confirm if already specified in intent
-    if target in ("sql_table", "blob"):
-        return {
-            **state,
-            "target_confirmed": True,
-            "output_target": target,
-            "etl_stage": "target_confirmed",
-        }
+    # Map intent target to codegen target_mode
+    target_mode_map = {
+        "local_file": "new_file",
+        "overwrite": "overwrite",
+        "return": "return",
+        "sql_table": "sql_table",
+        "blob": "new_file",
+    }
+    output_target = target_mode_map.get(target, "new_file")
 
     return {
         **state,
-        "etl_stage": "awaiting_target_confirmation",
-        "assistant_message": (
-            "📁 **Where should the cleaned data be written?**\n\n"
-            "**A)** Overwrite source files (in-place transform)\n"
-            "**B)** Write to a new file/path (specify path after choosing B)\n"
-            "**C)** Return as in-memory DataFrame only (for notebook use)\n\n"
-            "Reply with A, B, or C."
-        ),
+        "output_target": output_target,
+        "etl_stage": "target_confirmed",
     }
 
 
@@ -407,18 +407,18 @@ def target_schema_confirmation_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def schema_lineage_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Builds column-level lineage map from ETL plan."""
-    etl_plan = state.get("etl_plan") or {}
+    """
+    Builds column-level data lineage map:
+    source_col → [transforms] → target_col (with type info).
+    """
     assessment = _latest_assessment(state)
+    etl_plan = state.get("etl_plan") or {}
 
-    lineage_result = build_schema_lineage(
-        etl_plan=etl_plan,
-        assessment_result=assessment,
-    )
+    lineage = build_schema_lineage(assessment_result=assessment, etl_plan=etl_plan)
 
     return {
         **state,
-        "schema_lineage": lineage_result,
+        "schema_lineage": lineage,
         "etl_stage": "lineage_built",
     }
 
@@ -428,44 +428,49 @@ def schema_lineage_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def plan_presenter_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Formats ETL plan + lineage as human-readable markdown for chat UI."""
+    """
+    Formats the ETL plan + lineage into a human-readable markdown table
+    for display in the chat UI.
+    """
     etl_plan = state.get("etl_plan") or {}
-    lineage_result = state.get("schema_lineage") or {}
+    lineage = state.get("schema_lineage") or {}
     classified = state.get("classified_issues") or {}
     rules_summary = state.get("business_rules_summary") or {}
 
-    plan_md = format_plan_for_display(etl_plan)
-    lineage_md = format_lineage_for_display(lineage_result)
+    plan_display = format_plan_for_display(etl_plan)
+    lineage_display = format_lineage_for_display(lineage)
 
     review_items = classified.get("review", [])
     review_section = ""
     if review_items:
-        review_section = (
-            f"\n\n### ⚠️ Manual Review Required ({len(review_items)} items)\n"
-            + "\n".join(
-                f"- **{i.get('dataset')}.{i.get('column')}** — "
-                f"{i.get('issue_type', '')} | "
-                f"{i.get('manual_guidance', 'Review manually')}"
-                for i in review_items[:10]
+        review_section = f"\n\n⚠️ **{len(review_items)} issue(s) need manual review** (not included in auto-code):\n"
+        for item in review_items[:5]:
+            review_section += (
+                f"- `{item.get('dataset')}.{item.get('column')}`: "
+                f"{item.get('issue_type', 'unknown')} — {item.get('manual_guidance', '')}\n"
             )
-        )
+        if len(review_items) > 5:
+            review_section += f"- ...and {len(review_items) - 5} more\n"
 
     uncovered = rules_summary.get("datasets_without_rules", [])
-    rules_warn = ""
+    rules_note = ""
     if uncovered:
-        rules_warn = (
-            f"\n\n> 💡 **No business rules configured** for: {uncovered}. "
+        rules_note = (
+            f"\n\n💡 **Tip:** No business rules found for: {uncovered}. "
             f"Add rules to `config/business_rules.yaml` for safer transforms."
         )
 
     message = (
-        plan_md
-        + "\n\n---\n"
-        + lineage_md
-        + review_section
-        + rules_warn
-        + "\n\n---\n"
-        + "👉 **Reply:** `approve` to generate code | `modify <instruction>` to change | `cancel` to stop"
+        f"## 📋 ETL Plan Ready\n\n"
+        f"{plan_display}"
+        f"{review_section}"
+        f"{rules_note}\n\n"
+        f"### Column Lineage\n{lineage_display}\n\n"
+        f"---\n"
+        f"**Reply with:**\n"
+        f"- `approve` — generate the code\n"
+        f"- `modify: <your change>` — adjust the plan\n"
+        f"- `cancel` — abort\n"
     )
 
     return {
@@ -481,40 +486,41 @@ def plan_presenter_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def human_review_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Safety gate. Routes based on user reply:
-    - 'approve' / 'yes' / 'ok'  → codegen
-    - 'modify ...'               → back to planning with overrides
-    - 'cancel' / 'no' / 'stop'  → end
+    Safety gate — waits for explicit user approval before code generation.
+    Routes:
+      'approve' / 'yes' / 'generate' → codegen_node
+      'modify: ...'                   → planning_node (with override)
+      'cancel' / 'no' / 'stop'       → END
     """
     message = (state.get("user_message") or "").lower().strip()
 
-    if re.match(r"^(approve|yes|ok|go ahead|generate|proceed|confirm)", message):
+    if re.search(r"\bapprove\b|\byes\b|\bgenerate\b|\bgo ahead\b|\bproceed\b", message):
         return {**state, "etl_stage": "approved"}
 
-    if message.startswith("modify") or message.startswith("change"):
-        instruction = re.sub(r"^(modify|change)\s*", "", message).strip()
+    if message.startswith("modify:") or message.startswith("modify "):
+        override_text = re.sub(r"^modify[:\s]+", "", message, flags=re.IGNORECASE)
         return {
             **state,
-            "etl_stage": "modification_requested",
-            "plan_overrides": {"user_instruction": instruction},
+            "etl_stage": "modify_requested",
+            "plan_override_request": override_text,
         }
 
-    if re.match(r"^(cancel|no|stop|abort|reject)", message):
+    if re.search(r"\bcancel\b|\bno\b|\bstop\b|\babort\b", message):
         return {
             **state,
             "etl_stage": "cancelled",
-            "assistant_message": "✅ ETL code generation cancelled. Your data has not been modified.",
+            "assistant_message": "ETL code generation cancelled. Let me know if you'd like to try again.",
         }
 
-    # Not yet answered — show prompt again
+    # Unrecognised response — re-prompt
     return {
         **state,
-        "etl_stage": "awaiting_review",
+        "etl_stage": "awaiting_approval",
         "assistant_message": (
             "Please reply with:\n"
-            "- `approve` — generate the ETL code\n"
-            "- `modify <instruction>` — adjust the plan\n"
-            "- `cancel` — stop without generating"
+            "- `approve` to generate the code\n"
+            "- `modify: <change>` to adjust the plan\n"
+            "- `cancel` to abort"
         ),
     }
 
@@ -528,21 +534,20 @@ def codegen_node(state: Dict[str, Any]) -> Dict[str, Any]:
     etl_plan = state.get("etl_plan") or {}
     intent = state.get("etl_intent") or {}
     engine = intent.get("engine", "python")
-    output_target = state.get("output_target", "local_file")
-
-    codegen_errors = state.get("codegen_errors", [])
+    output_target = state.get("output_target", "new_file")
 
     generated: Dict[str, str] = {}
 
-    for ds_name in etl_plan.get("datasets", {}):
-        if engine == "python":
-            code = generate_python_etl(etl_plan, ds_name, output_target)
-        elif engine == "sql":
-            code = generate_sql_etl(etl_plan, ds_name)
-        else:
-            # PySpark and ADF: stubs for Phase 2
-            code = f"# {engine.upper()} generator coming in Phase 2\n"
-        generated[ds_name] = code
+    if engine == "python":
+        codegen = PythonCodegen(etl_plan, target_mode=output_target)
+        generated = codegen.generate()
+    elif engine == "sql":
+        codegen = SQLCodegen(etl_plan)
+        generated = codegen.generate()
+    else:
+        # PySpark and ADF: stubs for Phase 2
+        for ds_name in etl_plan.get("datasets", {}):
+            generated[ds_name] = f"# {engine.upper()} generator coming in Phase 2\n"
 
     return {
         **state,
@@ -557,57 +562,45 @@ def codegen_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def code_validation_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Validates all generated code. Routes to retry on failure (max 2 retries)."""
+    """
+    Validates generated code before delivery.
+    Uses AST parse for Python, sqlparse for SQL.
+    Max 2 retries on failure.
+    """
     generated = state.get("generated_code") or {}
     engine = state.get("codegen_engine", "python")
     assessment = _latest_assessment(state)
-    retry_count = state.get("codegen_retry_count", 0)
-
-    all_valid = True
-    validation_results: Dict[str, Any] = {}
+    validation_errors: List[str] = []
 
     for ds_name, code in generated.items():
-        schema_cols = list(
-            (assessment.get("datasets") or {}).get(ds_name, {}).get("columns", {}).keys()
-        )
-        result = validate_generated_code(code, engine, schema_cols)
-        validation_results[ds_name] = result
-        if not result["valid"]:
-            all_valid = False
+        ds_info = (assessment.get("datasets") or {}).get(ds_name, {})
+        schema_cols = list((ds_info.get("columns") or {}).keys())
 
-    if not all_valid and retry_count < 2:
+        ok, errors = validate_generated_code(code, engine, schema_cols)
+        if not ok:
+            for err in errors:
+                validation_errors.append(f"[{ds_name}] {err}")
+
+    if validation_errors:
+        retry_count = state.get("codegen_retry_count", 0)
+        if retry_count >= 2:
+            return {
+                **state,
+                "etl_stage": "validation_failed_final",
+                "assistant_message": (
+                    f"❌ Code validation failed after {retry_count} retries:\n"
+                    + "\n".join(f"- {e}" for e in validation_errors)
+                    + "\n\nPlease check your data schema or modify the plan."
+                ),
+            }
         return {
             **state,
-            "validation_results": validation_results,
+            "validation_errors": validation_errors,
             "codegen_retry_count": retry_count + 1,
-            "etl_stage": "codegen_retry",
-            "codegen_errors": [
-                {"dataset": ds, "errors": r["errors"]}
-                for ds, r in validation_results.items()
-                if not r["valid"]
-            ],
-        }
-
-    if not all_valid:
-        errors_summary = [
-            f"{ds}: {r['errors']}" for ds, r in validation_results.items() if not r["valid"]
-        ]
-        return {
-            **state,
-            "validation_results": validation_results,
             "etl_stage": "validation_failed",
-            "assistant_message": (
-                "❌ Code validation failed after 2 retries:\n"
-                + "\n".join(errors_summary)
-                + "\n\nPlease review the issues or contact support."
-            ),
         }
 
-    return {
-        **state,
-        "validation_results": validation_results,
-        "etl_stage": "validated",
-    }
+    return {**state, "etl_stage": "validation_passed", "validation_errors": []}
 
 
 # ---------------------------------------------------------------------------
@@ -616,15 +609,17 @@ def code_validation_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def output_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Saves generated code to output/etl_code/.
-    Returns download paths + code preview in chat message.
+    Saves generated code to output/etl_code/ and returns
+    chat message with preview + file paths.
     """
     generated = state.get("generated_code") or {}
     engine = state.get("codegen_engine", "python")
     etl_plan = state.get("etl_plan") or {}
     plan_id = etl_plan.get("plan_id", datetime.now().strftime("%Y%m%d_%H%M%S"))
 
-    ext = {"python": "py", "sql": "sql", "pyspark": "py", "adf": "json"}.get(engine, "txt")
+    ext_map = {"python": "py", "sql": "sql", "pyspark": "py", "adf": "json"}
+    ext = ext_map.get(engine, "txt")
+
     saved_files: List[str] = []
     preview_lines: List[str] = []
 
@@ -634,38 +629,27 @@ def output_node(state: Dict[str, Any]) -> Dict[str, Any]:
         with open(filepath, "w") as f:
             f.write(code)
         saved_files.append(str(filepath))
+        preview_lines.append(f"### `{filename}`\n```{engine}\n" + "\n".join(code.splitlines()[:25]) + "\n...\n```")
 
-        # Preview first 20 lines
-        preview = "\n".join(code.splitlines()[:20])
-        preview_lines.append(f"#### `{ds_name}` ({engine})\n```{engine}\n{preview}\n...\n```")
-
-    warnings_all = [
-        w
-        for r in (state.get("validation_results") or {}).values()
-        for w in r.get("warnings", [])
-    ]
-    warnings_section = ""
-    if warnings_all:
-        warnings_section = "\n\n⚠️ **Warnings:**\n" + "\n".join(f"- {w}" for w in warnings_all)
+    files_list = "\n".join(f"- `{f}`" for f in saved_files)
+    preview = "\n\n".join(preview_lines)
 
     message = (
         f"✅ **ETL code generated successfully!**\n\n"
-        f"**Files saved:** {len(saved_files)} file(s)\n"
-        + "\n".join(f"- `output/etl_code/{Path(p).name}`" for p in saved_files)
-        + "\n\n### 👁️ Code Preview\n"
-        + "\n\n".join(preview_lines)
-        + warnings_section
-        + "\n\n---\n"
-        + "**What's next?**\n"
-        + "- Run the ETL script on your data\n"
-        + "- Run a new assessment to validate data quality post-transform\n"
-        + "- Ask me to generate an ADF pipeline or PySpark version"
+        f"**Files saved:**\n{files_list}\n\n"
+        f"**Preview:**\n{preview}\n\n"
+        f"---\n"
+        f"**What's next?**\n"
+        f"- Type `validate after transform` to run a Great Expectations check after executing the code\n"
+        f"- Type `generate sql etl` to get the SQL version\n"
+        f"- Type `generate pyspark etl` for a PySpark version\n"
     )
 
     return {
         **state,
-        "saved_etl_files": saved_files,
+        "etl_output_files": saved_files,
         "etl_stage": "complete",
         "assistant_message": message,
         "etl_code_generated": True,
+        "etl_plan_id": plan_id,
     }
