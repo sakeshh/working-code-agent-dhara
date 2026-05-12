@@ -1,80 +1,94 @@
-# Business Rules Registry — Agent Dhara
-# =========================================
-# Define dataset-level and column-level constraints that override
-# the transformation suggester's default suggestions.
-#
-# Structure:
-#   datasets:
-#     <dataset_name>:
-#       never_drop_rows: bool          # If true, fill_or_drop will FILL only
-#       never_drop_columns: [col, ...] # These columns must never be removed
-#       required_non_null: [col, ...]  # These columns must always have values
-#       valid_values:                  # Allowed values for specific columns
-#         <column>: [val1, val2, ...]
-#       numeric_range:                 # Valid range for numeric columns
-#         <column>:
-#           min: number
-#           max: number
-#       custom_rules: [str, ...]       # Free-text rules shown to user during review
-#
-# Usage: Loaded by capture_business_rules_node at the start of ETL flow.
-# Overrides: planning_node uses these to constrain transform choices.
-# =========================================
+# ============================================================
+# Agent Dhara — Business Rules Registry
+# ============================================================
+# Format:
+#   <dataset_name>:
+#     columns:
+#       <column_name>:
+#         never_drop: true/false       — row must not be deleted even if null
+#         never_null: true/false       — column must always be non-null
+#         allowed_values: [...]        — enum whitelist
+#         min_value: <number>          — numeric lower bound
+#         max_value: <number>          — numeric upper bound
+#         unique: true/false           — must be unique across dataset
+#         regex: "<pattern>"           — value must match regex
+#     row_rules:
+#       never_delete: true/false       — no rows may ever be deleted from this dataset
+#       dedup_key: [col1, col2]        — columns that define a unique record
+# ============================================================
 
-# --- Default global rules (apply to ALL datasets unless overridden) ---
-global:
-  never_drop_rows: false
-  flag_instead_of_drop: false
+# Default fallback rules (apply when no dataset-specific rules exist)
+_defaults:
+  columns:
+    id:
+      never_null: true
+      unique: true
+      never_drop: true
+    created_at:
+      never_null: false
+    updated_at:
+      never_null: false
 
-# --- Example dataset rules (edit or add your datasets below) ---
-datasets:
-  customers:
-    never_drop_rows: true
-    never_drop_columns:
-      - customer_id
-      - email
-    required_non_null:
-      - customer_id
-    valid_values:
-      status: ["ACTIVE", "INACTIVE", "PENDING", "SUSPENDED"]
-    custom_rules:
-      - "customer_id must be globally unique — never deduplicate by partial key"
-      - "email is PII — do not log raw values in output reports"
+# ── Example: customers dataset ──────────────────────────────
+customers:
+  columns:
+    customer_id:
+      never_null: true
+      unique: true
+      never_drop: true
+    email:
+      never_null: false
+      regex: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    status:
+      allowed_values: ["ACTIVE", "INACTIVE", "PENDING", "CLOSED"]
+    revenue:
+      min_value: 0
+    age:
+      min_value: 0
+      max_value: 120
+  row_rules:
+    never_delete: false
+    dedup_key: ["customer_id"]
 
-  orders:
-    never_drop_rows: false
-    required_non_null:
-      - order_id
-      - customer_id
-    numeric_range:
-      amount:
-        min: 0
-        max: 1000000
-      quantity:
-        min: 1
-        max: 10000
-    valid_values:
-      status: ["PENDING", "CONFIRMED", "SHIPPED", "DELIVERED", "CANCELLED", "REFUNDED"]
-    custom_rules:
-      - "amount must always be > 0 — zero-amount orders indicate a data entry error"
-      - "orders.customer_id must exist in customers.customer_id (referential integrity)"
+# ── Example: orders dataset ─────────────────────────────────
+orders:
+  columns:
+    order_id:
+      never_null: true
+      unique: true
+      never_drop: true
+    customer_id:
+      never_null: true
+      never_drop: true
+    amount:
+      min_value: 0
+    status:
+      allowed_values: ["PENDING", "CONFIRMED", "SHIPPED", "DELIVERED", "CANCELLED", "REFUNDED"]
+  row_rules:
+    never_delete: true
+    dedup_key: ["order_id"]
 
-  products:
-    never_drop_rows: false
-    required_non_null:
-      - product_id
-      - sku
-    numeric_range:
-      price:
-        min: 0
-        max: 999999
-    custom_rules:
-      - "sku must follow format: [A-Z]{3}-[0-9]{4} (e.g. ABC-1234)"
-      - "price of 0 is allowed for free/promotional products"
+# ── Example: products dataset ───────────────────────────────
+products:
+  columns:
+    product_id:
+      never_null: true
+      unique: true
+      never_drop: true
+    price:
+      min_value: 0
+    stock_quantity:
+      min_value: 0
+  row_rules:
+    never_delete: false
+    dedup_key: ["product_id"]
 
-# Add your project-specific datasets below:
+# ── Add your own datasets below ─────────────────────────────
 # my_dataset:
-#   never_drop_rows: true
-#   required_non_null: [id]
-#   valid_values:
-#     category: ["A", "B", "C"]
+#   columns:
+#     my_column:
+#       never_null: true
+#       allowed_values: ["A", "B", "C"]
+#   row_rules:
+#     never_delete: false
+#     dedup_key: ["my_column"]
