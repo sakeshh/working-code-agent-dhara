@@ -3,10 +3,14 @@ Router Orchestrator — unified entry point for all intent routing.
 
 Layered routing strategy:
   Layer 1 → Adversarial / safety guard        (rule-based, unbypassable)
-  Layer 1b→ Code generation guard             (rule-based, unbypassable)
   Layer 2 → Keyword matching                  (existing code, free, 0ms)
   Layer 3 → LLM Router                        (fallback, ~100-150 tokens)
   Layer 4 → Final fallback                    (return None)
+
+Note: ETL code generation intents (generate etl code, build pipeline, etc.)
+are now handled by chat_graph.py via the generate_etl_code / show_etl_plan
+nodes. The former Layer 1b code-gen blocker has been removed to allow those
+messages to pass through to chat_graph routing.
 
 Usage:
     from agent.router_orchestrator import route_message
@@ -26,34 +30,6 @@ from agent.llm_router import llm_classify_intent
 from agent.agent_system_prompt import OUT_OF_SCOPE_REPLY, ADVERSARIAL_REPLY
 
 logger = logging.getLogger(__name__)
-
-# ── Hardcoded code-generation guard (triple safety net) ─────────────────────
-_CODE_KEYWORDS = (
-    "generate code", "write code", "etl code", "generate etl code",
-    "generate etl", "write etl", "create etl", "build etl",
-    "python code", "python script", "write python", "write a python",
-    "write sql", "generate sql", "sql script",
-    "write script", "generate script", "create script",
-    "write a script", "give me code", "give code", "show me code",
-    "write me code", "code for this", "code to fix", "code to clean",
-    "write pipeline", "build pipeline", "create pipeline",
-    "generate pipeline", "build a pipeline", "write a pipeline",
-    "pyspark", "spark code", "write pandas", "pandas code",
-    "write dbt", "generate dbt", "dbt model",
-    "write airflow", "generate airflow", "airflow dag",
-    "write dag", "generate dag",
-    "automate this", "automate the fix", "write automation",
-)
-
-_CODE_OOS_REPLY = (
-    "I can't generate ETL code or scripts. "
-    "I only analyse data quality issues from your assessment.\n\n"
-    "Try asking:\n"
-    "- 'What are the top issues in my data?'\n"
-    "- 'Which datasets should I fix first?'\n"
-    "- 'Show me null issues only'\n"
-    "- 'Generate a DQ report'"
-)
 
 
 def route_message(
@@ -83,18 +59,9 @@ def route_message(
             "reply": ADVERSARIAL_REPLY,
         }
 
-    # ── Layer 1b: Code generation guard (before keyword matching) ────────────
-    if any(k in low for k in _CODE_KEYWORDS):
-        logger.info("Router: code generation request blocked")
-        return {
-            "intent": 7,
-            "tool": "none",
-            "reason": "code_generation_not_supported",
-            "source": "code_guard",
-            "reply": _CODE_OOS_REPLY,
-        }
-
-    # ── Layer 1c: General OOD keyword guard ──────────────────────────────────
+    # ── Layer 1b: General OOD keyword guard ──────────────────────────────────
+    # NOTE: ETL/code-gen keywords are intentionally NOT blocked here.
+    # They are routed to chat_graph.py (generate_etl_code / show_etl_plan nodes).
     if _is_ood(low):
         logger.info("Router: out-of-domain keyword detected")
         return {
