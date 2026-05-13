@@ -127,6 +127,10 @@ class Plan:
     do_dq_check: bool = True
     do_dq_recommendations: bool = False
     do_transform: bool = False
+    # ETL code generation flags (Phase 1+)
+    do_etl_codegen: bool = False
+    etl_engine: str = "python"  # python | sql | pyspark | adf
+    etl_target: str = "return_df"  # return_df | overwrite_source | new_path
 
 
 class MasterAgent:
@@ -152,17 +156,23 @@ class MasterAgent:
         if cfg is not None:
             try:
                 system = (
-                    "You are a routing controller for a data assessment system.\n"
+                    "You are a routing controller for a data assessment and ETL system.\n"
                     "Return ONLY valid JSON. No markdown.\n\n"
                     "Choose which steps to run based on the user request.\n"
-                    "Schema discovery is done by listing tables/files; extraction runs profiling+D Q.\n"
-                    "If user asks to clean/fix/transform, enable dq_recommendations and transform.\n\n"
+                    "Schema discovery is done by listing tables/files; extraction runs profiling+DQ.\n"
+                    "If user asks to clean/fix/transform, enable dq_recommendations and transform.\n"
+                    "If user asks to generate ETL code, enable do_etl_codegen. Detect engine from\n"
+                    "keywords: 'python'->python, 'sql'->sql, 'spark'/'pyspark'->pyspark, 'adf'->adf.\n"
+                    "If user asks to push to blob/file/table, set etl_target accordingly.\n\n"
                     "JSON schema:\n"
                     "{\n"
                     '  "do_extract": boolean,\n'
                     '  "do_dq_check": boolean,\n'
                     '  "do_dq_recommendations": boolean,\n'
                     '  "do_transform": boolean,\n'
+                    '  "do_etl_codegen": boolean,\n'
+                    '  "etl_engine": "python"|"sql"|"pyspark"|"adf",\n'
+                    '  "etl_target": "return_df"|"overwrite_source"|"new_path",\n'
                     '  "reason": string\n'
                     "}\n"
                 )
@@ -180,7 +190,7 @@ class MasterAgent:
                         model=cfg.model,
                         messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
                         temperature=0.0,
-                        max_tokens=180,
+                        max_tokens=220,
                     )
                 else:
                     from openai import OpenAI  # type: ignore
@@ -190,7 +200,7 @@ class MasterAgent:
                         model=cfg.model,
                         messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
                         temperature=0.0,
-                        max_tokens=180,
+                        max_tokens=220,
                     )
                 raw = (resp.choices[0].message.content or "").strip()
                 obj = json.loads(raw)
@@ -199,10 +209,17 @@ class MasterAgent:
                     do_dq_check=bool(obj.get("do_dq_check", True)),
                     do_dq_recommendations=bool(obj.get("do_dq_recommendations", False)),
                     do_transform=bool(obj.get("do_transform", False)),
+                    do_etl_codegen=bool(obj.get("do_etl_codegen", False)),
+                    etl_engine=str(obj.get("etl_engine", "python")),
+                    etl_target=str(obj.get("etl_target", "return_df")),
                 )
             except Exception:
                 # Fall back to deterministic routing below.
                 pass
+
+        # ------------------------------------------------------------------ #
+        # Deterministic fallback routing                                      #
+        # ------------------------------------------------------------------ #
 
         wants_quality = any(
             k in txt
@@ -223,6 +240,36 @@ class MasterAgent:
                 "cleanliness",
             )
         )
+
+        # FIX ZERO: ETL code generation intents added to deterministic router
+        wants_etl_codegen = any(
+            k in txt
+            for k in (
+                "generate etl",
+                "etl code",
+                "generate code",
+                "build pipeline",
+                "generate pipeline",
+                "generate transformations",
+                "generate transformation code",
+                "write etl",
+                "create etl",
+                "etl script",
+                "transformation script",
+                "generate script",
+                "generate sql",
+                "generate python",
+                "generate pyspark",
+                "generate adf",
+                "adf pipeline",
+                "data pipeline code",
+                "cleaning code",
+                "fix code",
+                "repair code",
+                "write cleaning",
+            )
+        )
+
         wants_transform = any(
             k in txt
             for k in (
@@ -255,6 +302,34 @@ class MasterAgent:
                 "fetch",
             )
         )
+
+        # Detect ETL engine from message
+        etl_engine = "python"
+        if any(k in txt for k in ("pyspark", "spark")):
+            etl_engine = "pyspark"
+        elif "sql" in txt and "generate" in txt:
+            etl_engine = "sql"
+        elif "adf" in txt:
+            etl_engine = "adf"
+
+        # Detect target
+        etl_target = "return_df"
+        if any(k in txt for k in ("overwrite", "in-place", "in place", "replace source")):
+            etl_target = "overwrite_source"
+        elif any(k in txt for k in ("new table", "new file", "write to", "save to", "output to")):
+            etl_target = "new_path"
+
+        # ETL codegen: needs DQ + recommendations to feed the planner
+        if wants_etl_codegen:
+            return Plan(
+                do_extract=True,
+                do_dq_check=True,
+                do_dq_recommendations=True,
+                do_transform=True,
+                do_etl_codegen=True,
+                etl_engine=etl_engine,
+                etl_target=etl_target,
+            )
 
         # If user asks for transform, we implicitly need DQ checks to drive suggestions.
         if wants_transform:
@@ -330,4 +405,3 @@ def classify_intent(message: str, context: Optional[Dict[str, Any]] = None) -> O
     from agent.conversational_intents import classify_intent as _classify_intent
 
     return _classify_intent(message, context or {})
-

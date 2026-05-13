@@ -1,94 +1,147 @@
-# ============================================================
+# =============================================================================
 # Agent Dhara — Business Rules Registry
-# ============================================================
-# Format:
-#   <dataset_name>:
-#     columns:
-#       <column_name>:
-#         never_drop: true/false       — row must not be deleted even if null
-#         never_null: true/false       — column must always be non-null
-#         allowed_values: [...]        — enum whitelist
-#         min_value: <number>          — numeric lower bound
-#         max_value: <number>          — numeric upper bound
-#         unique: true/false           — must be unique across dataset
-#         regex: "<pattern>"           — value must match regex
-#     row_rules:
-#       never_delete: true/false       — no rows may ever be deleted from this dataset
-#       dedup_key: [col1, col2]        — columns that define a unique record
-# ============================================================
+# config/business_rules.yaml
+#
+# Purpose:
+#   Per-dataset ETL constraints used by capture_business_rules_node (Node 2)
+#   in the ETL LangGraph. Rules defined here OVERRIDE transformation_suggester
+#   suggestions and are enforced during planning_node (Node 6).
+#
+# Rule structure:
+#   datasets:
+#     <dataset_name>:
+#       rules:
+#         - column: <column_name>        # or "*" for dataset-level rules
+#           rule: <rule_type>
+#           value: <rule_value>          # optional, depends on rule type
+#           severity: error | warning    # error = blocks ETL, warning = alerts only
+#           message: <human description>
+#
+# Rule types:
+#   never_drop_rows         — Row count must not decrease after ETL
+#   never_null              — Column must have 0 nulls after ETL
+#   must_be_positive        — Numeric column must be > 0
+#   must_be_in_set          — Value must be in the provided set
+#   min_value / max_value   — Numeric range enforcement
+#   regex_match             — Column must match pattern
+#   no_duplicates           — No duplicate values allowed (distinct from dedup)
+#   preserve_column         — Column must not be dropped or renamed
+#   no_auto_cast            — Disable automatic type coercion for this column
+# =============================================================================
 
-# Default fallback rules (apply when no dataset-specific rules exist)
-_defaults:
-  columns:
-    id:
-      never_null: true
-      unique: true
-      never_drop: true
-    created_at:
-      never_null: false
-    updated_at:
-      never_null: false
+global:
+  # Default engine if user does not specify
+  default_engine: python          # python | sql | pyspark | adf
+  # Default output target if user does not specify
+  default_target: return_df       # return_df | overwrite_source | new_path
+  # Maximum rows to drop as a fraction of total rows (0.05 = 5%)
+  max_drop_fraction: 0.05
+  # Whether to auto-approve plans with only AUTO-classified steps
+  auto_approve_auto_only_plans: false
 
-# ── Example: customers dataset ──────────────────────────────
-customers:
-  columns:
-    customer_id:
-      never_null: true
-      unique: true
-      never_drop: true
-    email:
-      never_null: false
-      regex: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
-    status:
-      allowed_values: ["ACTIVE", "INACTIVE", "PENDING", "CLOSED"]
-    revenue:
-      min_value: 0
-    age:
-      min_value: 0
-      max_value: 120
-  row_rules:
-    never_delete: false
-    dedup_key: ["customer_id"]
 
-# ── Example: orders dataset ─────────────────────────────────
-orders:
-  columns:
-    order_id:
-      never_null: true
-      unique: true
-      never_drop: true
-    customer_id:
-      never_null: true
-      never_drop: true
-    amount:
-      min_value: 0
-    status:
-      allowed_values: ["PENDING", "CONFIRMED", "SHIPPED", "DELIVERED", "CANCELLED", "REFUNDED"]
-  row_rules:
-    never_delete: true
-    dedup_key: ["order_id"]
+# =============================================================================
+# Dataset-specific rules
+# Add your dataset names and rules below.
+# Examples are provided — update with your actual dataset column names.
+# =============================================================================
 
-# ── Example: products dataset ───────────────────────────────
-products:
-  columns:
-    product_id:
-      never_null: true
-      unique: true
-      never_drop: true
-    price:
-      min_value: 0
-    stock_quantity:
-      min_value: 0
-  row_rules:
-    never_delete: false
-    dedup_key: ["product_id"]
+datasets:
 
-# ── Add your own datasets below ─────────────────────────────
-# my_dataset:
-#   columns:
-#     my_column:
-#       never_null: true
-#       allowed_values: ["A", "B", "C"]
-#   row_rules:
-#     never_delete: false
-#     dedup_key: ["my_column"]
+  # ---------------------------------------------------------------------------
+  # customers — example dataset
+  # ---------------------------------------------------------------------------
+  customers:
+    rules:
+      - column: customer_id
+        rule: never_null
+        severity: error
+        message: "customer_id is the primary key — must never be null after ETL"
+
+      - column: customer_id
+        rule: no_duplicates
+        severity: error
+        message: "customer_id must be unique — no duplicate customer records allowed"
+
+      - column: email
+        rule: regex_match
+        value: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+        severity: warning
+        message: "email must be a valid format after sanitization"
+
+      - column: status
+        rule: must_be_in_set
+        value: ["ACTIVE", "INACTIVE", "SUSPENDED", "PENDING"]
+        severity: error
+        message: "status must be one of ACTIVE, INACTIVE, SUSPENDED, PENDING"
+
+      - column: "*"
+        rule: never_drop_rows
+        severity: error
+        message: "customers table must not lose rows during ETL — use fill instead of drop for nulls"
+
+  # ---------------------------------------------------------------------------
+  # orders — example dataset
+  # ---------------------------------------------------------------------------
+  orders:
+    rules:
+      - column: order_id
+        rule: never_null
+        severity: error
+        message: "order_id is primary key"
+
+      - column: customer_id
+        rule: never_null
+        severity: error
+        message: "orders must always reference a customer"
+
+      - column: amount
+        rule: must_be_positive
+        severity: error
+        message: "order amount must be > 0"
+
+      - column: amount
+        rule: max_value
+        value: 1000000
+        severity: warning
+        message: "orders above 1,000,000 should be flagged for manual review"
+
+      - column: order_date
+        rule: never_null
+        severity: error
+        message: "every order must have an order_date"
+
+      - column: order_date
+        rule: no_auto_cast
+        severity: warning
+        message: "order_date format is managed by upstream system — do not auto-cast"
+
+  # ---------------------------------------------------------------------------
+  # products — example dataset
+  # ---------------------------------------------------------------------------
+  products:
+    rules:
+      - column: product_id
+        rule: never_null
+        severity: error
+        message: "product_id is primary key"
+
+      - column: price
+        rule: must_be_positive
+        severity: error
+        message: "product price must be > 0"
+
+      - column: category
+        rule: preserve_column
+        severity: error
+        message: "category column must not be dropped or renamed — used by downstream reports"
+
+  # ---------------------------------------------------------------------------
+  # Add your own datasets below following the same pattern:
+  # ---------------------------------------------------------------------------
+  # my_dataset:
+  #   rules:
+  #     - column: my_id
+  #       rule: never_null
+  #       severity: error
+  #       message: "my_id is PK"
