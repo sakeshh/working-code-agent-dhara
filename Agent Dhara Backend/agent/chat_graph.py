@@ -120,12 +120,12 @@ def _first_location_index(source_root: Dict[str, Any], want_type: str) -> Option
     return None
 
 
-_MASTER_SYSTEM = """You are Agent Dhara's Master (Supervisor) router for **data exploration + data quality only**.
+_MASTER_SYSTEM = """You are Agent Dhara's Master (Supervisor) router for **data exploration + data quality + ETL code generation**.
 You MUST return ONLY valid JSON and nothing else.
 
 Your job:
 - Understand the user request in natural language.
-- Decide what action to take next (route to the right "agent": extraction vs data quality vs navigation).
+- Decide what action to take next (route to the right "agent": extraction vs data quality vs ETL vs navigation).
 - Provide the minimal arguments needed to execute it.
 
 CORE PRODUCT RULES (must obey when choosing actions):
@@ -195,10 +195,10 @@ Behavior rules:
 - If the user asks a data-quality question (nulls, duplicates, outliers, per-dataset issue totals) AFTER a report was generated,
   choose a DQ action (dq_overview / show_null_columns / dq_duplicates) and answer from the latest assessment.
 - If the user asks for extraction (show columns, show top rows, preview data) for selected datasets, choose an extraction action.
-- If the user says "generate etl code", "build etl pipeline", "generate transformations", or "create cleaning script",
-  choose action=generate_etl_code.
-- If the user says "etl python", "python etl", "generate python etl plan", choose action=generate_etl_code with args {"engine": "python"}.
-- If the user says "etl sql", "sql etl", "generate sql etl plan", choose action=generate_etl_code with args {"engine": "sql"}.
+- If the user says "generate etl code", "build etl pipeline", "generate transformations", "create cleaning script",
+  "fix the data", "clean the data", "write transformation code", choose action=generate_etl_code.
+- If the user says "etl python", "python etl", "generate python etl", choose action=generate_etl_code with args {"engine": "python"}.
+- If the user says "etl sql", "sql etl", "generate sql etl", choose action=generate_etl_code with args {"engine": "sql"}.
 - If the user says "etl spark" or "pyspark etl", choose action=generate_etl_code with args {"engine": "pyspark"}.
 - If the user says "show etl plan" or "show the plan", choose action=show_etl_plan.
 - If the user says "approve" or "yes" or "proceed" during ETL review, choose action=generate_etl_code with args {"approved": true}.
@@ -244,6 +244,17 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
     if not state.get("last_assessment_result") and session.get("assessment_result"):
         state = {**state, "last_assessment_result": session["assessment_result"]}
 
+    # FIX #4: Restore ETL state from session on resume so multi-turn works
+    etl_resume_keys = (
+        "etl_stage", "etl_plan", "etl_intent", "classified_issues",
+        "transformation_manifest", "business_rules", "business_rules_summary",
+        "schema_lineage", "output_target", "target_confirmed",
+        "generated_code", "saved_etl_files",
+    )
+    for k in etl_resume_keys:
+        if not state.get(k) and session.get(k) is not None:
+            state = {**state, k: session[k]}
+
     etl_stage = state.get("etl_stage", "")
     action_args = state.get("action_args") or {}
 
@@ -253,14 +264,17 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
         state = human_review_node({**state, "user_message": "cancel"})
         return _etl_state_to_chat_state(state)
 
+    # FIX #3: code_validation_node sets stage to "validation_passed", not "validated"
     if action_args.get("approved") and etl_stage in ("plan_presented", "awaiting_review"):
         state = {**state, "etl_stage": "approved", "user_message": "approve"}
         state = codegen_node(state)
         state = code_validation_node(state)
-        if state.get("etl_stage") == "codegen_retry":
+        if state.get("etl_stage") == "validation_failed":
+            # Retry once
+            state = {**state, "codegen_retry_count": (state.get("codegen_retry_count") or 0) + 1}
             state = codegen_node(state)
             state = code_validation_node(state)
-        if state.get("etl_stage") in ("validated", "code_generated"):
+        if state.get("etl_stage") in ("validation_passed", "code_generated"):
             state = output_node(state)
         return _etl_state_to_chat_state(state)
 
@@ -269,7 +283,8 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
                  "plan_overrides": {"user_instruction": state.get("user_message", "")}}
         state = planning_node(state)
         state = validate_dag_node(state)
-        if state.get("etl_stage") == "dag_invalid_retry":
+        if state.get("etl_stage") == "dag_invalid":
+            # Retry once
             state = planning_node(state)
             state = validate_dag_node(state)
         if state.get("etl_stage") == "dag_valid":
@@ -287,7 +302,7 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
         elif msg.startswith("C"):
             state = {**state, "target_confirmed": True, "output_target": "memory", "etl_stage": "target_confirmed"}
         else:
-            # Still waiting
+            # Still waiting — re-show the options
             return _etl_state_to_chat_state(state)
         # Continue to lineage + present
         state = schema_lineage_node(state)
@@ -300,7 +315,7 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
         state = {**state, "etl_stage": "ready_for_planning"}
 
     # --- Fresh start OR engine override from button ---
-    engine = action_args.get("engine", state.get("etl_intent", {}).get("engine", "python"))
+    engine = action_args.get("engine", (state.get("etl_intent") or {}).get("engine", "python"))
     etl_intent = state.get("etl_intent") or {}
     state = {**state, "etl_intent": {**etl_intent, "engine": engine}}
 
@@ -326,10 +341,11 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
 
         state = planning_node(state)
         state = validate_dag_node(state)
-        if state.get("etl_stage") == "dag_invalid_retry":
+        # FIX #3: stage set by validate_dag_node is "dag_invalid" not "dag_invalid_retry"
+        if state.get("etl_stage") == "dag_invalid":
             state = planning_node(state)
             state = validate_dag_node(state)
-        if state.get("etl_stage") == "dag_validation_failed":
+        if state.get("etl_stage") == "dag_error_unresolved":
             return _etl_state_to_chat_state(state)
 
         state = target_schema_confirmation_node(state)
@@ -365,13 +381,13 @@ def _etl_state_to_chat_state(state: Dict[str, Any]) -> Dict[str, Any]:
             {"id": "target_b", "text": "📁 B — Write to new file",   "send": "B"},
             {"id": "target_c", "text": "💾 C — In-memory only",      "send": "C"},
         )
-    elif etl_stage in ("complete", "validated"):
+    elif etl_stage in ("complete", "validation_passed"):
         options = _flow_options(
             {"id": "new_etl",  "text": "🔄 Generate Another",         "send": "generate etl code"},
             {"id": "assess",   "text": "🔍 Run New Assessment",        "send": "assess my data"},
             {"id": "restart",  "text": "✅ Restart",                  "send": "restart"},
         )
-    elif etl_stage in ("cancelled", "dag_validation_failed", "validation_failed", "blocked", "no_assessment"):
+    elif etl_stage in ("cancelled", "dag_error_unresolved", "validation_failed_final", "blocked", "no_assessment"):
         options = _flow_options(
             {"id": "restart", "text": "✅ Restart", "send": "restart"},
             {"id": "back",    "text": "🔙 Back",    "send": "back"},
@@ -397,13 +413,8 @@ def _etl_state_to_chat_state(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Existing chat graph nodes (unchanged)
+# Chat graph node functions
 # ---------------------------------------------------------------------------
-
-def _node_route(state: ChatState) -> str:
-    """Route to the correct node based on LLM-chosen action."""
-    return state.get("action", "help")
-
 
 def _node_generate_etl_code(state: ChatState) -> ChatState:
     """Entry point for ETL code generation — runs the full 14-node pipeline."""
@@ -449,9 +460,21 @@ def build_chat_graph():
     g = StateGraph(ChatState)
 
     # ---- Load session ----
+    # FIX #4: Also restore ETL state from session so multi-turn ETL flow works
     def _node_load_session(state: ChatState) -> ChatState:
         session = load_session(state["session_id"])
-        return {**state, "session": session}
+        restored: Dict[str, Any] = {}
+        etl_session_keys = (
+            "etl_stage", "etl_plan", "etl_intent", "classified_issues",
+            "transformation_manifest", "business_rules", "business_rules_summary",
+            "schema_lineage", "output_target", "target_confirmed",
+            "generated_code", "saved_etl_files", "etl_code_generated",
+            "last_assessment_result",
+        )
+        for k in etl_session_keys:
+            if session.get(k) is not None and not state.get(k):
+                restored[k] = session[k]
+        return {**state, "session": session, **restored}
 
     # ---- LLM Router ----
     def _node_llm_router(state: ChatState) -> ChatState:
@@ -474,7 +497,6 @@ def build_chat_graph():
     # ---- Save session ----
     def _node_save_session(state: ChatState) -> ChatState:
         session = state.get("session") or {}
-        # Persist ETL state back into session for continuity
         for etl_key in (
             "etl_stage", "etl_plan", "etl_intent", "classified_issues",
             "transformation_manifest", "business_rules", "schema_lineage",
@@ -512,9 +534,10 @@ def build_chat_graph():
         }
 
     # ---- Register all nodes ----
+    # FIX #1: _node_route REMOVED as a node — it returned a string which crashes LangGraph.
+    #         Conditional routing now reads action directly from llm_router output state.
     g.add_node("load_session", _node_load_session)
     g.add_node("llm_router", _node_llm_router)
-    g.add_node("route", _node_route)
     g.add_node("help", _node_help)
     g.add_node("generate_etl_code", _node_generate_etl_code)
     g.add_node("show_etl_plan", _node_show_etl_plan)
@@ -523,19 +546,19 @@ def build_chat_graph():
     # ---- Entry ----
     g.set_entry_point("load_session")
     g.add_edge("load_session", "llm_router")
-    g.add_edge("llm_router", "route")
 
-    # ---- Conditional routing from LLM decision ----
+    # FIX #1 + FIX #2: Route directly from llm_router; all 25 DQ/extraction
+    # actions fall through to "help" as a safe default until their nodes are
+    # added. This prevents KeyError crashes on any unrecognised action.
     g.add_conditional_edges(
-        "route",
+        "llm_router",
         lambda s: s.get("action", "help"),
         {
-            "help": "help",
             "generate_etl_code": "generate_etl_code",
-            "show_etl_plan": "show_etl_plan",
-            # All other actions fall through to help for now
-            # (existing actions like list_sources, assess_selected_files, etc.
-            #  should be added back here from the original chat_graph.py)
+            "show_etl_plan":     "show_etl_plan",
+            # All other actions (list_sources, dq_overview, assess_selected_files,
+            # summarize_report, etc.) safely fall to help for now.
+            # To enable them: add their node with g.add_node() and map them here.
         },
     )
 
