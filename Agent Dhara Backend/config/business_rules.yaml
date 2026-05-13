@@ -1,147 +1,67 @@
 # =============================================================================
-# Agent Dhara — Business Rules Registry
-# config/business_rules.yaml
+# Agent Dhara — Business Rules Configuration
+# =============================================================================
+# This file defines dataset-level and global constraints that override
+# the ETL planner's automatic decisions.
 #
-# Purpose:
-#   Per-dataset ETL constraints used by capture_business_rules_node (Node 2)
-#   in the ETL LangGraph. Rules defined here OVERRIDE transformation_suggester
-#   suggestions and are enforced during planning_node (Node 6).
+# Structure:
+#   global:           — rules that apply to ALL datasets
+#   datasets:         — rules scoped to a specific dataset (by name)
 #
-# Rule structure:
-#   datasets:
-#     <dataset_name>:
-#       rules:
-#         - column: <column_name>        # or "*" for dataset-level rules
-#           rule: <rule_type>
-#           value: <rule_value>          # optional, depends on rule type
-#           severity: error | warning    # error = blocks ETL, warning = alerts only
-#           message: <human description>
+# Supported rule keys (per dataset):
+#   never_drop_columns: [list]   — these columns must NEVER be drop_nulls'd
+#   required_columns:   [list]   — these columns must be present in the output
+#   no_auto_fill:       [list]   — do not auto-fill nulls for these columns
+#   max_null_pct:       0.0-1.0  — abort ETL if null% exceeds this threshold
+#   dedup_key:          [list]   — columns to use for deduplication (overrides auto)
+#   target_table:       string   — destination SQL table name (sql engine only)
+#   date_format:        string   — strftime format for all date columns
 #
-# Rule types:
-#   never_drop_rows         — Row count must not decrease after ETL
-#   never_null              — Column must have 0 nulls after ETL
-#   must_be_positive        — Numeric column must be > 0
-#   must_be_in_set          — Value must be in the provided set
-#   min_value / max_value   — Numeric range enforcement
-#   regex_match             — Column must match pattern
-#   no_duplicates           — No duplicate values allowed (distinct from dedup)
-#   preserve_column         — Column must not be dropped or renamed
-#   no_auto_cast            — Disable automatic type coercion for this column
+# Supported rule keys (global):
+#   encoding:         string     — default encoding for file writes (default: utf-8)
+#   null_fill_strategy: string   — 'mode' | 'mean' | 'drop' (default: mode)
+#   dedup_strategy:   string     — 'keep_first' | 'keep_last' | 'flag' (default: keep_first)
 # =============================================================================
 
 global:
-  # Default engine if user does not specify
-  default_engine: python          # python | sql | pyspark | adf
-  # Default output target if user does not specify
-  default_target: return_df       # return_df | overwrite_source | new_path
-  # Maximum rows to drop as a fraction of total rows (0.05 = 5%)
-  max_drop_fraction: 0.05
-  # Whether to auto-approve plans with only AUTO-classified steps
-  auto_approve_auto_only_plans: false
+  encoding: utf-8
+  null_fill_strategy: mode       # mode | mean | drop
+  dedup_strategy: keep_first     # keep_first | keep_last | flag
+  date_format: "%Y-%m-%d"
 
-
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Dataset-specific rules
-# Add your dataset names and rules below.
-# Examples are provided — update with your actual dataset column names.
-# =============================================================================
+# Add your dataset names below and configure per-dataset constraints.
+#
+# Example:
+# datasets:
+#   customers:
+#     never_drop_columns:
+#       - customer_id
+#       - email
+#     required_columns:
+#       - customer_id
+#       - name
+#     no_auto_fill:
+#       - customer_id
+#     max_null_pct: 0.30
+#     dedup_key:
+#       - customer_id
+#
+#   orders:
+#     never_drop_columns:
+#       - order_id
+#       - customer_id
+#     required_columns:
+#       - order_id
+#       - order_date
+#       - amount
+#     max_null_pct: 0.10
+#     dedup_key:
+#       - order_id
+#     target_table: dbo.orders_cleaned
+# ---------------------------------------------------------------------------
 
-datasets:
-
-  # ---------------------------------------------------------------------------
-  # customers — example dataset
-  # ---------------------------------------------------------------------------
-  customers:
-    rules:
-      - column: customer_id
-        rule: never_null
-        severity: error
-        message: "customer_id is the primary key — must never be null after ETL"
-
-      - column: customer_id
-        rule: no_duplicates
-        severity: error
-        message: "customer_id must be unique — no duplicate customer records allowed"
-
-      - column: email
-        rule: regex_match
-        value: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
-        severity: warning
-        message: "email must be a valid format after sanitization"
-
-      - column: status
-        rule: must_be_in_set
-        value: ["ACTIVE", "INACTIVE", "SUSPENDED", "PENDING"]
-        severity: error
-        message: "status must be one of ACTIVE, INACTIVE, SUSPENDED, PENDING"
-
-      - column: "*"
-        rule: never_drop_rows
-        severity: error
-        message: "customers table must not lose rows during ETL — use fill instead of drop for nulls"
-
-  # ---------------------------------------------------------------------------
-  # orders — example dataset
-  # ---------------------------------------------------------------------------
-  orders:
-    rules:
-      - column: order_id
-        rule: never_null
-        severity: error
-        message: "order_id is primary key"
-
-      - column: customer_id
-        rule: never_null
-        severity: error
-        message: "orders must always reference a customer"
-
-      - column: amount
-        rule: must_be_positive
-        severity: error
-        message: "order amount must be > 0"
-
-      - column: amount
-        rule: max_value
-        value: 1000000
-        severity: warning
-        message: "orders above 1,000,000 should be flagged for manual review"
-
-      - column: order_date
-        rule: never_null
-        severity: error
-        message: "every order must have an order_date"
-
-      - column: order_date
-        rule: no_auto_cast
-        severity: warning
-        message: "order_date format is managed by upstream system — do not auto-cast"
-
-  # ---------------------------------------------------------------------------
-  # products — example dataset
-  # ---------------------------------------------------------------------------
-  products:
-    rules:
-      - column: product_id
-        rule: never_null
-        severity: error
-        message: "product_id is primary key"
-
-      - column: price
-        rule: must_be_positive
-        severity: error
-        message: "product price must be > 0"
-
-      - column: category
-        rule: preserve_column
-        severity: error
-        message: "category column must not be dropped or renamed — used by downstream reports"
-
-  # ---------------------------------------------------------------------------
-  # Add your own datasets below following the same pattern:
-  # ---------------------------------------------------------------------------
-  # my_dataset:
-  #   rules:
-  #     - column: my_id
-  #       rule: never_null
-  #       severity: error
-  #       message: "my_id is PK"
+datasets: {}
+  # Add your dataset rules here following the example above.
+  # Dataset names must match exactly what appears in your assessment report.
