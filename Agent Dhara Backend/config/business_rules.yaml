@@ -1,94 +1,46 @@
-# ============================================================
 # Agent Dhara — Business Rules Registry
-# ============================================================
+# Define per-dataset constraints that override ETL plan suggestions.
+# These are loaded by etl_graph_nodes.node_capture_business_rules()
+#
 # Format:
 #   <dataset_name>:
 #     columns:
 #       <column_name>:
-#         never_drop: true/false       — row must not be deleted even if null
-#         never_null: true/false       — column must always be non-null
-#         allowed_values: [...]        — enum whitelist
-#         min_value: <number>          — numeric lower bound
-#         max_value: <number>          — numeric upper bound
-#         unique: true/false           — must be unique across dataset
-#         regex: "<pattern>"           — value must match regex
-#     row_rules:
-#       never_delete: true/false       — no rows may ever be deleted from this dataset
-#       dedup_key: [col1, col2]        — columns that define a unique record
-# ============================================================
+#         never_drop: true/false       # never drop this column or its rows
+#         required: true/false         # must be non-null always
+#         allowed_values: [...]        # whitelist of valid values
+#         min_value: <number>          # numeric floor
+#         max_value: <number>          # numeric ceiling
+#         pattern: "<regex>"           # must match this pattern
+#     global:
+#       never_drop_rows: true/false    # never drop any rows from this dataset
+#       primary_key: <column_name>     # enforced PK — dedup on this column
 
-# Default fallback rules (apply when no dataset-specific rules exist)
-_defaults:
-  columns:
-    id:
-      never_null: true
-      unique: true
-      never_drop: true
-    created_at:
-      never_null: false
-    updated_at:
-      never_null: false
-
-# ── Example: customers dataset ──────────────────────────────
-customers:
-  columns:
-    customer_id:
-      never_null: true
-      unique: true
-      never_drop: true
-    email:
-      never_null: false
-      regex: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
-    status:
-      allowed_values: ["ACTIVE", "INACTIVE", "PENDING", "CLOSED"]
-    revenue:
-      min_value: 0
-    age:
-      min_value: 0
-      max_value: 120
-  row_rules:
-    never_delete: false
-    dedup_key: ["customer_id"]
-
-# ── Example: orders dataset ─────────────────────────────────
-orders:
-  columns:
-    order_id:
-      never_null: true
-      unique: true
-      never_drop: true
-    customer_id:
-      never_null: true
-      never_drop: true
-    amount:
-      min_value: 0
-    status:
-      allowed_values: ["PENDING", "CONFIRMED", "SHIPPED", "DELIVERED", "CANCELLED", "REFUNDED"]
-  row_rules:
-    never_delete: true
-    dedup_key: ["order_id"]
-
-# ── Example: products dataset ───────────────────────────────
-products:
-  columns:
-    product_id:
-      never_null: true
-      unique: true
-      never_drop: true
-    price:
-      min_value: 0
-    stock_quantity:
-      min_value: 0
-  row_rules:
-    never_delete: false
-    dedup_key: ["product_id"]
-
-# ── Add your own datasets below ─────────────────────────────
-# my_dataset:
+# Example — uncomment and customize for your datasets:
+#
+# customers:
 #   columns:
-#     my_column:
-#       never_null: true
-#       allowed_values: ["A", "B", "C"]
-#   row_rules:
-#     never_delete: false
-#     dedup_key: ["my_column"]
+#     customer_id:
+#       never_drop: true
+#       required: true
+#     status:
+#       allowed_values: ["ACTIVE", "INACTIVE", "PENDING"]
+#     age:
+#       min_value: 0
+#       max_value: 120
+#   global:
+#     never_drop_rows: false
+#     primary_key: customer_id
+#
+# orders:
+#   columns:
+#     order_id:
+#       never_drop: true
+#       required: true
+#     revenue:
+#       min_value: 0
+#   global:
+#     never_drop_rows: true
+#     primary_key: order_id
+
+# Add your dataset rules below:
