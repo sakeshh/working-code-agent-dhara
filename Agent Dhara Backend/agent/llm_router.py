@@ -21,12 +21,15 @@ logger = logging.getLogger(__name__)
 
 # Tool name → intent ID mapping (matches conversational_intents.py)
 TOOL_TO_INTENT: Dict[str, int] = {
-    "report_generate": 1,
-    "top_issues":      2,
-    "issue_filter":    3,
-    "triage":          4,
-    "cross_dataset":   5,
-    "none":            7,
+    "report_generate":   1,
+    "top_issues":        2,
+    "issue_filter":      3,
+    "triage":            4,
+    "cross_dataset":     5,
+    # ETL pipeline actions — routed to chat_graph ETL nodes
+    "generate_etl_code": 10,
+    "show_etl_plan":     11,
+    "none":              7,
 }
 
 
