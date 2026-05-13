@@ -10,13 +10,10 @@ The LLM produces a structured JSON "action plan" which is then executed determin
 from __future__ import annotations
 
 import json
-import time
 from typing import Any, Dict, List, Optional, TypedDict, Tuple
 
 from agent.master_agent import load_sources_config
-from agent.model_config import load_llm_config
-from agent.openai_usage import usage_dict_from_response
-from agent.session_store import add_experience, list_recent_experiences, load_session, save_session
+from agent.session_store import load_session, save_session
 
 # ETL pipeline nodes (14-node pipeline)
 from agent.etl_graph_nodes import (
@@ -99,30 +96,6 @@ def _flow_options(*items: List[Dict[str, str]]) -> List[Dict[str, str]]:
             continue
         out.append({"id": str(it.get("id") or it["text"]), "text": str(it["text"]), "send": str(it["send"])})
     return out
-
-
-def _prompt_choose_action() -> Dict[str, Any]:
-    reply = "📌 Choose Action:\n1. View Data in Files\n2. Generate Report"
-    return {
-        "reply": reply,
-        "payload": {
-            "step": "action",
-            "options": _flow_options(
-                {"id": "view", "text": "👁️ View Data", "send": "view data"},
-                {"id": "report", "text": "📑 Generate Report", "send": "generate report"},
-                {"id": "back", "text": "🔙 Back", "send": "back"},
-                {"id": "restart", "text": "✅ Restart", "send": "restart"},
-            ),
-        },
-    }
-
-
-def _first_location_index(source_root: Dict[str, Any], want_type: str) -> Optional[int]:
-    locs = list(((source_root or {}).get("locations") or []))
-    for i, loc in enumerate(locs):
-        if str(loc.get("type") or "").lower() == want_type:
-            return i
-    return None
 
 
 _MASTER_SYSTEM = """You are Agent Dhara's Master (Supervisor) router for **data exploration + data quality + ETL code generation**.
@@ -488,6 +461,10 @@ def build_chat_graph():
         }
 
     # ---- Save session ----
+    # FIX: return {**state, "session": session} so the updated session dict
+    # is reflected in the state that flows to END. Previously `return state`
+    # meant ETL keys written into the local `session` variable were discarded
+    # if state["session"] was a separate copy.
     def _node_save_session(state: ChatState) -> ChatState:
         session = state.get("session") or {}
         for etl_key in (
@@ -499,7 +476,7 @@ def build_chat_graph():
             if state.get(etl_key) is not None:
                 session[etl_key] = state[etl_key]
         save_session(state["session_id"], session)
-        return state
+        return {**state, "session": session}  # FIX: was `return state`
 
     # ---- Help node ----
     def _node_help(state: ChatState) -> ChatState:
