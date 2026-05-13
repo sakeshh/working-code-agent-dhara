@@ -81,6 +81,11 @@ class ChatState(TypedDict, total=False):
     assessment_result: Dict[str, Any]
 
 
+# Actions that have registered LangGraph nodes.
+# All other actions fall through to "help" until their nodes are wired up.
+_ROUTED_ACTIONS = frozenset({"generate_etl_code", "show_etl_plan", "help"})
+
+
 def _flow_options(*items: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Options are consumed by the frontend to render buttons.
@@ -244,7 +249,7 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
     if not state.get("last_assessment_result") and session.get("assessment_result"):
         state = {**state, "last_assessment_result": session["assessment_result"]}
 
-    # FIX #4: Restore ETL state from session on resume so multi-turn works
+    # Restore ETL state from session on resume so multi-turn works
     etl_resume_keys = (
         "etl_stage", "etl_plan", "etl_intent", "classified_issues",
         "transformation_manifest", "business_rules", "business_rules_summary",
@@ -264,13 +269,11 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
         state = human_review_node({**state, "user_message": "cancel"})
         return _etl_state_to_chat_state(state)
 
-    # FIX #3: code_validation_node sets stage to "validation_passed", not "validated"
     if action_args.get("approved") and etl_stage in ("plan_presented", "awaiting_review"):
         state = {**state, "etl_stage": "approved", "user_message": "approve"}
         state = codegen_node(state)
         state = code_validation_node(state)
         if state.get("etl_stage") == "validation_failed":
-            # Retry once
             state = {**state, "codegen_retry_count": (state.get("codegen_retry_count") or 0) + 1}
             state = codegen_node(state)
             state = code_validation_node(state)
@@ -284,7 +287,6 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
         state = planning_node(state)
         state = validate_dag_node(state)
         if state.get("etl_stage") == "dag_invalid":
-            # Retry once
             state = planning_node(state)
             state = validate_dag_node(state)
         if state.get("etl_stage") == "dag_valid":
@@ -302,16 +304,13 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
         elif msg.startswith("C"):
             state = {**state, "target_confirmed": True, "output_target": "memory", "etl_stage": "target_confirmed"}
         else:
-            # Still waiting — re-show the options
             return _etl_state_to_chat_state(state)
-        # Continue to lineage + present
         state = schema_lineage_node(state)
         state = plan_presenter_node(state)
         return _etl_state_to_chat_state(state)
 
     # --- Resume from awaiting_clarification ---
     if etl_stage == "awaiting_clarification":
-        # User answered the high-severity warning question — proceed
         state = {**state, "etl_stage": "ready_for_planning"}
 
     # --- Fresh start OR engine override from button ---
@@ -324,7 +323,6 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
         "target_confirmed", "lineage_built", "approved",
         "modification_requested",
     ):
-        # Full pipeline from scratch
         state = capture_etl_intent_node(state)
         if state.get("etl_stage") == "no_assessment":
             return _etl_state_to_chat_state(state)
@@ -341,7 +339,6 @@ def _run_etl_pipeline(state: ChatState) -> ChatState:
 
         state = planning_node(state)
         state = validate_dag_node(state)
-        # FIX #3: stage set by validate_dag_node is "dag_invalid" not "dag_invalid_retry"
         if state.get("etl_stage") == "dag_invalid":
             state = planning_node(state)
             state = validate_dag_node(state)
@@ -367,7 +364,6 @@ def _etl_state_to_chat_state(state: Dict[str, Any]) -> Dict[str, Any]:
     assistant_msg = state.get("assistant_message", "")
     etl_stage = state.get("etl_stage", "")
 
-    # Build appropriate options based on stage
     options = []
     if etl_stage == "plan_presented":
         options = _flow_options(
@@ -396,8 +392,6 @@ def _etl_state_to_chat_state(state: Dict[str, Any]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"step": f"etl_{etl_stage}"}
     if options:
         payload["options"] = options
-
-    # Attach code preview files if generated
     if state.get("saved_etl_files"):
         payload["etl_files"] = state["saved_etl_files"]
     if state.get("etl_plan"):
@@ -459,8 +453,7 @@ def build_chat_graph():
 
     g = StateGraph(ChatState)
 
-    # ---- Load session ----
-    # FIX #4: Also restore ETL state from session so multi-turn ETL flow works
+    # ---- Load session — also restores ETL state for multi-turn continuity ----
     def _node_load_session(state: ChatState) -> ChatState:
         session = load_session(state["session_id"])
         restored: Dict[str, Any] = {}
@@ -533,32 +526,33 @@ def build_chat_graph():
             },
         }
 
-    # ---- Register all nodes ----
-    # FIX #1: _node_route REMOVED as a node — it returned a string which crashes LangGraph.
-    #         Conditional routing now reads action directly from llm_router output state.
-    g.add_node("load_session", _node_load_session)
-    g.add_node("llm_router", _node_llm_router)
-    g.add_node("help", _node_help)
-    g.add_node("generate_etl_code", _node_generate_etl_code)
-    g.add_node("show_etl_plan", _node_show_etl_plan)
-    g.add_node("save_session", _node_save_session)
+    # ---- Register nodes ----
+    g.add_node("load_session",       _node_load_session)
+    g.add_node("llm_router",         _node_llm_router)
+    g.add_node("help",               _node_help)
+    g.add_node("generate_etl_code",  _node_generate_etl_code)
+    g.add_node("show_etl_plan",      _node_show_etl_plan)
+    g.add_node("save_session",       _node_save_session)
 
     # ---- Entry ----
     g.set_entry_point("load_session")
     g.add_edge("load_session", "llm_router")
 
-    # FIX #1 + FIX #2: Route directly from llm_router; all 25 DQ/extraction
-    # actions fall through to "help" as a safe default until their nodes are
-    # added. This prevents KeyError crashes on any unrecognised action.
+    # ---- Routing: normalise unknown actions to "help" so LangGraph never
+    #      raises ValueError on unregistered keys.
+    #      To add a new action: register its node above, add it to
+    #      _ROUTED_ACTIONS, and map it in the dict below. ----
+    def _router(s: ChatState) -> str:
+        action = s.get("action", "help")
+        return action if action in _ROUTED_ACTIONS else "help"
+
     g.add_conditional_edges(
         "llm_router",
-        lambda s: s.get("action", "help"),
+        _router,
         {
             "generate_etl_code": "generate_etl_code",
             "show_etl_plan":     "show_etl_plan",
-            # All other actions (list_sources, dq_overview, assess_selected_files,
-            # summarize_report, etc.) safely fall to help for now.
-            # To enable them: add their node with g.add_node() and map them here.
+            "help":              "help",   # catch-all for every unregistered action
         },
     )
 
